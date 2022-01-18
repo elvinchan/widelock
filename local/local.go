@@ -12,7 +12,7 @@ import (
 type set struct {
 	registry map[string]*mutex
 	ttls     heap.Interface // for cleanup expired lock
-	ttlAddCh chan struct{}  // signal when add new lock or extend exist lock
+	ttlTopCh chan struct{}  // signal when earliest expired lock change
 	closeCh  chan struct{}
 	mu       *sync.Mutex
 }
@@ -32,7 +32,7 @@ func New() widelock.MutexSet {
 	s := &set{
 		registry: make(map[string]*mutex),
 		ttls:     &mutexHeap{},
-		ttlAddCh: make(chan struct{}, 1),
+		ttlTopCh: make(chan struct{}, 1),
 		closeCh:  make(chan struct{}),
 		mu:       &sync.Mutex{},
 	}
@@ -50,7 +50,7 @@ func (s *set) cleaner() {
 			select {
 			case <-s.closeCh:
 				return
-			case <-s.ttlAddCh:
+			case <-s.ttlTopCh:
 				continue
 			}
 		}
@@ -69,6 +69,14 @@ func (s *set) cleaner() {
 			case <-s.closeCh:
 				t.Stop() // release timer before exit
 				return
+			case <-s.ttlTopCh:
+				// push v back to ttls
+				s.mu.Lock()
+				if v.(*mutex).ttlIndex == -1 {
+					heap.Push(s.ttls, v)
+				}
+				s.mu.Unlock()
+				continue
 			case <-t.C:
 			}
 		}
@@ -179,11 +187,6 @@ func (m *mutex) Extend(ctx context.Context, d time.Duration) error {
 	if o.ttlIndex == -1 {
 		// already pop from heap and waiting to unlock
 		heap.Push(m.set.ttls, o)
-		// notify ttl add if needed
-		select {
-		case m.set.ttlAddCh <- struct{}{}:
-		default:
-		}
 	} else {
 		heap.Fix(m.set.ttls, o.ttlIndex)
 	}
@@ -222,9 +225,11 @@ func (m *mutex) acquireLock() (bool, <-chan struct{}, error) {
 	if !m.ttl.IsZero() {
 		heap.Push(m.set.ttls, m)
 		// notify ttl add if needed
-		select {
-		case m.set.ttlAddCh <- struct{}{}:
-		default:
+		if m.ttlIndex == 0 {
+			select {
+			case m.set.ttlTopCh <- struct{}{}:
+			default:
+			}
 		}
 	}
 	// lock success

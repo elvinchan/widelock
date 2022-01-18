@@ -29,7 +29,7 @@ func TestMutexHeap(t *testing.T) {
 	testkit.Assert(t, v.(*mutex).ttl.Equal(time.Unix(1, 0)))
 
 	m2.ttl = time.Unix(1, 0)
-	heap.Fix(&mh, 2)
+	heap.Fix(&mh, m2.ttlIndex)
 	v = heap.Pop(&mh)
 	testkit.Assert(t, v.(*mutex) == m2)
 }
