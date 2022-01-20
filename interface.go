@@ -16,7 +16,7 @@ type Mutex interface {
 	TryLock(context.Context) (bool, error)
 	Unlock() error
 	Extend(context.Context, time.Duration) error
-	Valid(context.Context) (bool, error)
+	Valid(context.Context) bool
 	Name() string
 }
 
@@ -27,7 +27,7 @@ type Option interface {
 var (
 	ErrAlreadyClosed    = errors.New("widelock: set already closed")
 	ErrAlreadyUnlocked  = errors.New("widelock: already unlocked")
-	ErrLockNotFound     = errors.New("widelock: lock not found")
+	ErrLockNotHeld      = errors.New("widelock: lock not held")
 	ErrLockNotSetExpiry = errors.New("widelock: lock not set expiry")
 	ErrInvalidDuration  = errors.New("widelock: invalid duration")
 )

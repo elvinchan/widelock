@@ -1,4 +1,4 @@
-package local
+package consul
 
 import (
 	"container/heap"
@@ -7,12 +7,13 @@ import (
 	"time"
 
 	"github.com/elvinchan/widelock"
+	"github.com/hashicorp/consul/api"
 )
 
 type set struct {
-	registry map[string]*mutex
+	client   *api.Client
 	ttls     heap.Interface // for cleanup expired lock
-	ttlTopCh chan struct{}  // signal when earliest expired lock change
+	ttlTopCh chan struct{}  // signal when add new lock or extend exist lock
 	closeCh  chan struct{}
 	mu       *sync.Mutex
 }
@@ -23,14 +24,19 @@ type mutex struct {
 	ttl      time.Time
 	ttlIndex int
 	stopCh   chan struct{}
+	mu       *sync.Mutex
+
+	locker   *api.Lock
+	lockOpts *api.LockOptions
 
 	// options
+	lost     chan<- struct{}
 	duration time.Duration
 }
 
-func New() widelock.MutexSet {
+func New(client *api.Client) widelock.MutexSet {
 	s := &set{
-		registry: make(map[string]*mutex),
+		client:   client,
 		ttls:     &mutexHeap{},
 		ttlTopCh: make(chan struct{}, 1),
 		closeCh:  make(chan struct{}),
@@ -54,7 +60,8 @@ func (s *set) cleaner() {
 				continue
 			}
 		}
-		ttl := v.(*mutex).ttl // ttl may change, put this line in lock block
+		m := v.(*mutex)
+		ttl := m.ttl // ttl may change, put this line in lock block
 		s.mu.Unlock()
 
 		d := time.Until(ttl)
@@ -72,7 +79,7 @@ func (s *set) cleaner() {
 			case <-s.ttlTopCh:
 				// push v back to ttls
 				s.mu.Lock()
-				if v.(*mutex).ttlIndex == -1 {
+				if m.ttlIndex == -1 {
 					heap.Push(s.ttls, v)
 				}
 				s.mu.Unlock()
@@ -81,16 +88,17 @@ func (s *set) cleaner() {
 			}
 		}
 
-		s.mu.Lock()
-		m, ok := s.registry[v.(*mutex).name]
-		if !ok || m != v || m.ttl.After(time.Now()) {
-			// already unlocked or ttl has been extended
-			s.mu.Unlock()
+		m.mu.Lock()
+		if !m.isHeld() || m.ttl.After(time.Now()) {
+			m.mu.Unlock()
 			continue
 		}
-		delete(m.set.registry, m.name)
+		if err := m.locker.Unlock(); err != nil {
+			m.mu.Unlock()
+			continue // maybe network issue. retry?
+		}
 		close(m.stopCh)
-		s.mu.Unlock()
+		m.mu.Unlock()
 	}
 }
 
@@ -99,6 +107,16 @@ func (s *set) NewMutex(name string, opts ...widelock.Option) widelock.Mutex {
 		name:     name,
 		set:      s,
 		ttlIndex: -1,
+		mu:       &sync.Mutex{},
+		lockOpts: &api.LockOptions{
+			Key:   name,
+			Value: nil,
+			SessionOpts: &api.SessionEntry{
+				Name:      name,
+				LockDelay: 0,
+				TTL:       api.DefaultLockSessionTTL,
+			},
+		},
 	}
 	for _, opt := range opts {
 		opt.Apply(m)
@@ -127,7 +145,7 @@ func (s *set) checkNoClose() error {
 
 func (m *mutex) Lock(ctx context.Context) error {
 	for {
-		succ, stopCh, err := m.acquireLock()
+		succ, stopCh, err := m.acquireLock(ctx, true)
 		if err != nil {
 			return err
 		} else if succ {
@@ -144,7 +162,7 @@ func (m *mutex) Lock(ctx context.Context) error {
 }
 
 func (m *mutex) TryLock(ctx context.Context) (bool, error) {
-	succ, _, err := m.acquireLock()
+	succ, _, err := m.acquireLock(ctx, false)
 	return succ, err
 }
 
@@ -152,16 +170,19 @@ func (m *mutex) Unlock() error {
 	if err := m.set.checkNoClose(); err != nil {
 		return err
 	}
-	m.set.mu.Lock()
-	defer m.set.mu.Unlock()
-	o, ok := m.set.registry[m.name]
-	if !ok || o != m {
-		return widelock.ErrLockNotHeld
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.isHeld() {
+		return widelock.ErrAlreadyUnlocked
 	}
+	if err := m.locker.Unlock(); err != nil {
+		return err // maybe network issue. retry?
+	}
+	m.set.mu.Lock()
 	if m.ttlIndex != -1 {
 		heap.Remove(m.set.ttls, m.ttlIndex)
 	}
-	delete(m.set.registry, m.name)
+	m.set.mu.Unlock()
 	close(m.stopCh)
 	return nil
 }
@@ -173,22 +194,23 @@ func (m *mutex) Extend(ctx context.Context, d time.Duration) error {
 	if err := m.set.checkNoClose(); err != nil {
 		return err
 	}
-	m.set.mu.Lock()
-	defer m.set.mu.Unlock()
-	o, ok := m.set.registry[m.name]
-	if !ok || o != m {
-		return widelock.ErrLockNotHeld
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.isHeld() {
+		return widelock.ErrAlreadyUnlocked
 	}
-	if o.ttl.IsZero() {
+	if m.ttl.IsZero() {
 		return widelock.ErrLockNotSetExpiry
 	}
-	o.ttl.Add(d)
-	if o.ttlIndex == -1 {
+	m.set.mu.Lock()
+	m.ttl.Add(d)
+	if m.ttlIndex == -1 {
 		// already pop from heap and waiting to unlock
-		heap.Push(m.set.ttls, o)
+		heap.Push(m.set.ttls, m)
 	} else {
-		heap.Fix(m.set.ttls, o.ttlIndex)
+		heap.Fix(m.set.ttls, m.ttlIndex)
 	}
+	m.set.mu.Unlock()
 	return nil
 }
 
@@ -196,32 +218,36 @@ func (m *mutex) Valid(ctx context.Context) bool {
 	if err := m.set.checkNoClose(); err != nil {
 		return false
 	}
-	m.set.mu.Lock()
-	defer m.set.mu.Unlock()
-	o, ok := m.set.registry[m.name]
-	return ok && o == m
+	return m.isHeld()
 }
 
 func (m *mutex) Name() string {
 	return m.name
 }
 
-func (m *mutex) acquireLock() (bool, <-chan struct{}, error) {
+func (m *mutex) acquireLock(ctx context.Context, block bool) (bool, <-chan struct{}, error) {
 	if err := m.set.checkNoClose(); err != nil {
 		return false, nil, err
 	}
-	m.set.mu.Lock()
-	defer m.set.mu.Unlock()
-	o, ok := m.set.registry[m.name]
-	if ok {
-		return false, o.stopCh, nil
+	m.mu.Lock()
+	if m.isHeld() {
+		m.mu.Unlock()
+		return false, m.stopCh, nil
+	}
+	m.lockOpts.LockTryOnce = false
+	cl, err := m.set.client.LockOpts(m.lockOpts)
+	if err != nil {
+		m.mu.Unlock()
+		return false, nil, err
 	}
 	m.stopCh = make(chan struct{})
+	m.locker = cl
+
 	if m.duration > 0 {
 		m.ttl = time.Now().Add(m.duration)
 	}
-	m.set.registry[m.name] = m
 	if !m.ttl.IsZero() {
+		m.set.mu.Lock()
 		heap.Push(m.set.ttls, m)
 		// notify ttl add if needed
 		if m.ttlIndex == 0 {
@@ -230,7 +256,42 @@ func (m *mutex) acquireLock() (bool, <-chan struct{}, error) {
 			default:
 			}
 		}
+		m.set.mu.Unlock()
 	}
-	// lock success
+	m.mu.Unlock()
+
+	lostCh, err := m.locker.Lock(ctx.Done())
+	if err != nil {
+		return false, m.stopCh, err
+	}
+	go func() {
+		select {
+		case <-m.set.closeCh:
+			return
+		case <-lostCh:
+		}
+		m.mu.Lock()
+		if m.locker == cl && m.isHeld() { // release same mutex
+			m.set.mu.Lock()
+			if m.ttlIndex != -1 {
+				heap.Remove(m.set.ttls, m.ttlIndex)
+			}
+			m.set.mu.Unlock()
+			close(m.stopCh)
+		}
+		m.mu.Unlock()
+	}()
 	return true, nil, nil
+}
+
+func (m *mutex) isHeld() bool {
+	if m.stopCh == nil {
+		return false
+	}
+	select {
+	case <-m.stopCh:
+		return false
+	default:
+		return true
+	}
 }

@@ -1,4 +1,4 @@
-package local
+package consul
 
 import (
 	"context"
@@ -6,14 +6,24 @@ import (
 	"time"
 
 	"github.com/elvinchan/util-collects/testkit"
-	"github.com/elvinchan/widelock"
+	"github.com/hashicorp/consul/api"
 )
+
+var cc *api.Client
+
+func init() {
+	var err error
+	cc, err = api.NewClient(api.DefaultConfig())
+	if err != nil {
+		panic(err)
+	}
+}
 
 func TestLockUnlock(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	set := New()
+	set := New(cc)
 	t.Run("Simple", func(t *testing.T) {
 		t.Parallel()
 		now := time.Now()
@@ -27,6 +37,7 @@ func TestLockUnlock(t *testing.T) {
 			err := m.Unlock()
 			testkit.Assert(t, err == nil)
 		}()
+
 		err = m.Lock(ctx)
 		testkit.Assert(t, err == nil)
 		elapsed := time.Since(now)
@@ -56,51 +67,5 @@ func TestLockUnlock(t *testing.T) {
 
 		err = m.Unlock()
 		testkit.Assert(t, err == nil)
-	})
-}
-
-func TestClose(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	set := New()
-	m := set.NewMutex("close")
-
-	err := set.Close()
-	testkit.Assert(t, err == nil)
-
-	err = m.Lock(ctx)
-	testkit.Assert(t, err == widelock.ErrAlreadyClosed)
-
-	hold, err := m.TryLock(ctx)
-	testkit.Assert(t, hold == false)
-	testkit.Assert(t, err == widelock.ErrAlreadyClosed)
-
-	err = m.Extend(ctx, 1)
-	testkit.Assert(t, err == widelock.ErrAlreadyClosed)
-
-	valid := m.Valid(ctx)
-	testkit.Assert(t, valid == false)
-
-	err = set.Close()
-	testkit.Assert(t, err == widelock.ErrAlreadyClosed)
-}
-
-func TestExtend(t *testing.T) {
-	set := New()
-	ctx := context.Background()
-
-	t.Run("Expiry", func(t *testing.T) {
-		m := set.NewMutex("extend",
-			WithExpiry(time.Now().Add(time.Millisecond*2)))
-		err := m.Lock(ctx)
-		testkit.Assert(t, err == nil)
-
-		now := time.Now()
-		err = m.Lock(ctx)
-		testkit.Assert(t, err == nil)
-		elapsed := time.Since(now)
-		testkit.Assert(t, elapsed > time.Millisecond*2)
-		testkit.Assert(t, elapsed < time.Millisecond*100)
 	})
 }
