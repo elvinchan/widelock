@@ -16,10 +16,11 @@ func TestLockUnlock(t *testing.T) {
 	set := New()
 	t.Run("Simple", func(t *testing.T) {
 		t.Parallel()
-		now := time.Now()
-		m := set.NewMutex("simple")
+		m := set.NewMutex("t_simple")
 		err := m.Lock(ctx)
 		testkit.Assert(t, err == nil)
+
+		now := time.Now()
 
 		go func() {
 			// unlock after 1 millisecond
@@ -35,7 +36,7 @@ func TestLockUnlock(t *testing.T) {
 
 	t.Run("Context", func(t *testing.T) {
 		t.Parallel()
-		m := set.NewMutex("context")
+		m := set.NewMutex("t_context")
 		err := m.Lock(ctx)
 		testkit.Assert(t, err == nil)
 
@@ -64,7 +65,7 @@ func TestClose(t *testing.T) {
 
 	ctx := context.Background()
 	set := New()
-	m := set.NewMutex("close")
+	m := set.NewMutex("t_close")
 
 	err := set.Close()
 	testkit.Assert(t, err == nil)
@@ -91,7 +92,7 @@ func TestExtend(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("Expiry", func(t *testing.T) {
-		m := set.NewMutex("extend",
+		m := set.NewMutex("t_extend",
 			WithExpiry(time.Now().Add(time.Millisecond*2)))
 		err := m.Lock(ctx)
 		testkit.Assert(t, err == nil)

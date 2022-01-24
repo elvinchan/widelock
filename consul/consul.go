@@ -10,17 +10,24 @@ import (
 	"github.com/hashicorp/consul/api"
 )
 
-type set struct {
+const DefaultKeyPrefix = "widelock/"
+
+type Set struct {
 	client   *api.Client
+	session  string
 	ttls     heap.Interface // for cleanup expired lock
 	ttlTopCh chan struct{}  // signal when add new lock or extend exist lock
 	closeCh  chan struct{}
 	mu       *sync.Mutex
+
+	// options
+	prefix    string
+	deleteKey bool
 }
 
 type mutex struct {
 	name     string
-	set      *set
+	set      *Set
 	ttl      time.Time
 	ttlIndex int
 	stopCh   chan struct{}
@@ -34,19 +41,37 @@ type mutex struct {
 	duration time.Duration
 }
 
-func New(client *api.Client) widelock.MutexSet {
-	s := &set{
+func New(client *api.Client, opts ...widelock.OptionSet) (widelock.MutexSet, error) {
+	s := &Set{
 		client:   client,
+		prefix:   DefaultKeyPrefix,
 		ttls:     &mutexHeap{},
 		ttlTopCh: make(chan struct{}, 1),
 		closeCh:  make(chan struct{}),
 		mu:       &sync.Mutex{},
 	}
+	for _, opt := range opts {
+		opt.Apply(s)
+	}
+	cs := client.Session()
+	se := &api.SessionEntry{
+		TTL:       api.DefaultLockSessionTTL,
+		LockDelay: time.Millisecond,
+	}
+	if s.deleteKey {
+		se.Behavior = api.SessionBehaviorDelete
+	}
+	var err error
+	s.session, _, err = cs.Create(se, nil)
+	if err != nil {
+		return nil, err
+	}
 	go s.cleaner()
-	return s
+	go s.renewSessionPeriodic(cs)
+	return s, nil
 }
 
-func (s *set) cleaner() {
+func (s *Set) cleaner() {
 	var t *time.Timer
 	for {
 		s.mu.Lock()
@@ -102,20 +127,48 @@ func (s *set) cleaner() {
 	}
 }
 
-func (s *set) NewMutex(name string, opts ...widelock.Option) widelock.Mutex {
+func (s *Set) renewSessionPeriodic(cs *api.Session) {
+	ttl, _ := time.ParseDuration(api.DefaultLockSessionTTL)
+	waitDur := ttl / 2
+	lastRenewTime := time.Now()
+	for {
+		if time.Since(lastRenewTime) > ttl {
+			return
+		}
+		select {
+		case <-time.After(waitDur):
+			entry, _, err := cs.Renew(s.session, nil)
+			if err != nil {
+				// maybe network issue, retry
+				waitDur = time.Second
+				// TODO: log error
+				continue
+			}
+			if entry == nil {
+				// TODO: log ErrSessionExpired
+				return
+			}
+
+			// Handle the server updating the TTL
+			ttl, _ = time.ParseDuration(entry.TTL)
+			waitDur = ttl / 2
+			lastRenewTime = time.Now()
+		case <-s.closeCh:
+			return
+		}
+	}
+}
+
+func (s *Set) NewMutex(name string, opts ...widelock.Option) widelock.Mutex {
 	m := &mutex{
 		name:     name,
 		set:      s,
 		ttlIndex: -1,
 		mu:       &sync.Mutex{},
 		lockOpts: &api.LockOptions{
-			Key:   name,
-			Value: nil,
-			SessionOpts: &api.SessionEntry{
-				Name:      name,
-				LockDelay: 0,
-				TTL:       api.DefaultLockSessionTTL,
-			},
+			Key:     s.prefix + name,
+			Value:   nil,
+			Session: s.session,
 		},
 	}
 	for _, opt := range opts {
@@ -124,17 +177,32 @@ func (s *set) NewMutex(name string, opts ...widelock.Option) widelock.Mutex {
 	return m
 }
 
-func (s *set) Close() error {
+func (s *Set) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkNoClose(); err != nil {
 		return err
 	}
 	close(s.closeCh)
+	_, err := s.client.Session().Destroy(s.session, nil)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
-func (s *set) checkNoClose() error {
+// Cleanup cleanup all the locks with the same prefix in Set, no matter it is
+// held or not, even by another Set.
+// This may useful when you want to remove all the associate keys in Consul.
+func (s *Set) Cleanup() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kv := s.client.KV()
+	_, err := kv.DeleteTree(s.prefix, nil)
+	return err
+}
+
+func (s *Set) checkNoClose() error {
 	select {
 	case <-s.closeCh:
 		return widelock.ErrAlreadyClosed
@@ -177,6 +245,11 @@ func (m *mutex) Unlock() error {
 	}
 	if err := m.locker.Unlock(); err != nil {
 		return err // maybe network issue. retry?
+	}
+	if m.set.deleteKey {
+		if err := m.locker.Destroy(); err != nil {
+			return err // maybe network issue. retry?
+		}
 	}
 	m.set.mu.Lock()
 	if m.ttlIndex != -1 {

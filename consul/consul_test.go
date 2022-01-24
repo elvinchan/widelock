@@ -23,13 +23,18 @@ func TestLockUnlock(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	set := New(cc)
+	set, err := New(cc)
+	testkit.Assert(t, err == nil)
+	defer func() {
+		err := set.Close()
+		testkit.Assert(t, err == nil)
+	}()
 	t.Run("Simple", func(t *testing.T) {
-		t.Parallel()
-		now := time.Now()
-		m := set.NewMutex("simple")
+		m := set.NewMutex("t_simple")
 		err := m.Lock(ctx)
 		testkit.Assert(t, err == nil)
+
+		now := time.Now()
 
 		go func() {
 			// unlock after 1 millisecond
@@ -45,8 +50,7 @@ func TestLockUnlock(t *testing.T) {
 	})
 
 	t.Run("Context", func(t *testing.T) {
-		t.Parallel()
-		m := set.NewMutex("context")
+		m := set.NewMutex("t_context")
 		err := m.Lock(ctx)
 		testkit.Assert(t, err == nil)
 
@@ -68,4 +72,90 @@ func TestLockUnlock(t *testing.T) {
 		err = m.Unlock()
 		testkit.Assert(t, err == nil)
 	})
+}
+
+func TestClose(t *testing.T) {
+	t.Parallel()
+
+	set, err := New(cc)
+	testkit.Assert(t, err == nil)
+
+	se, _, err := cc.Session().Info(set.(*Set).session, nil)
+	testkit.Assert(t, err == nil)
+	testkit.Assert(t, se != nil)
+
+	err = set.Close()
+	testkit.Assert(t, err == nil)
+
+	se, _, err = cc.Session().Info(set.(*Set).session, nil)
+	testkit.Assert(t, err == nil)
+	testkit.Assert(t, se == nil)
+}
+
+func TestOptionSet(t *testing.T) {
+	t.Parallel()
+
+	t.Run("WithKeyPrefix", func(t *testing.T) {
+		ctx := context.Background()
+		set, err := New(cc, WithKeyPrefix("widelock/option_set"))
+		testkit.Assert(t, err == nil)
+		m := set.NewMutex("t_key_prefix")
+		err = m.Lock(ctx)
+		testkit.Assert(t, err == nil)
+
+		exist := existConsulKey(t, set.(*Set).prefix+m.Name())
+		testkit.Assert(t, exist)
+
+		err = m.Unlock()
+		testkit.Assert(t, err == nil)
+	})
+
+	t.Run("WithDeleteKey", func(t *testing.T) {
+		ctx := context.Background()
+		set, err := New(cc, WithDeleteKey())
+		testkit.Assert(t, err == nil)
+		m := set.NewMutex("t_delete_key")
+		err = m.Lock(ctx)
+		testkit.Assert(t, err == nil)
+
+		exist := existConsulKey(t, set.(*Set).prefix+m.Name())
+		testkit.Assert(t, exist)
+
+		err = m.Unlock()
+		testkit.Assert(t, err == nil)
+
+		exist = existConsulKey(t, set.(*Set).prefix+m.Name())
+		testkit.Assert(t, !exist)
+	})
+}
+
+func TestCleanup(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	set, err := New(cc, WithKeyPrefix("widelock/cleanup/"))
+	testkit.Assert(t, err == nil)
+	m := set.NewMutex("t_close")
+	err = m.Lock(ctx)
+	testkit.Assert(t, err == nil)
+
+	originalSet := set.(*Set)
+	kv := originalSet.client.KV()
+	kvPair, _, err := kv.Get(originalSet.prefix+m.Name(), nil)
+	testkit.Assert(t, err == nil)
+	testkit.Assert(t, kvPair != nil)
+	testkit.Assert(t, kvPair.Key == originalSet.prefix+m.Name())
+
+	err = originalSet.Cleanup()
+	testkit.Assert(t, err == nil)
+
+	kvPair, _, err = kv.Get(originalSet.prefix+m.Name(), nil)
+	testkit.Assert(t, err == nil)
+	testkit.Assert(t, kvPair == nil)
+}
+
+func existConsulKey(t *testing.T, name string) bool {
+	pair, _, err := cc.KV().Get(name, nil)
+	testkit.Assert(t, err == nil)
+	return pair != nil
 }

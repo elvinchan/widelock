@@ -20,6 +20,10 @@ type Mutex interface {
 	Name() string
 }
 
+type OptionSet interface {
+	Apply(MutexSet)
+}
+
 type Option interface {
 	Apply(Mutex)
 }
